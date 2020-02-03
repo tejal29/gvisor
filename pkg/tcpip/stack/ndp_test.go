@@ -42,6 +42,7 @@ const (
 	linkAddr1                = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x06")
 	linkAddr2                = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x07")
 	linkAddr3                = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x08")
+	linkAddr4                = tcpip.LinkAddress("\x02\x02\x03\x04\x05\x09")
 	defaultTimeout           = 100 * time.Millisecond
 	defaultAsyncEventTimeout = time.Second
 )
@@ -50,6 +51,7 @@ var (
 	llAddr1 = header.LinkLocalAddr(linkAddr1)
 	llAddr2 = header.LinkLocalAddr(linkAddr2)
 	llAddr3 = header.LinkLocalAddr(linkAddr3)
+	llAddr4 = header.LinkLocalAddr(linkAddr4)
 	dstAddr = tcpip.FullAddress{
 		Addr: "\x0a\x0b\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01",
 		Port: 25,
@@ -82,39 +84,6 @@ func prefixSubnetAddr(offset uint8, linkAddr tcpip.LinkAddress) (tcpip.AddressWi
 	subnet := prefix.Subnet()
 
 	return prefix, subnet, addrForSubnet(subnet, linkAddr)
-}
-
-// TestDADDisabled tests that an address successfully resolves immediately
-// when DAD is not enabled (the default for an empty stack.Options).
-func TestDADDisabled(t *testing.T) {
-	opts := stack.Options{
-		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
-	}
-
-	e := channel.New(0, 1280, linkAddr1)
-	s := stack.New(opts)
-	if err := s.CreateNIC(1, e); err != nil {
-		t.Fatalf("CreateNIC(_) = %s", err)
-	}
-
-	if err := s.AddAddress(1, header.IPv6ProtocolNumber, addr1); err != nil {
-		t.Fatalf("AddAddress(_, %d, %s) = %s", header.IPv6ProtocolNumber, addr1, err)
-	}
-
-	// Should get the address immediately since we should not have performed
-	// DAD on it.
-	addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
-	if err != nil {
-		t.Fatalf("stack.GetMainNICAddress(_, _) err = %s", err)
-	}
-	if addr.Address != addr1 {
-		t.Fatalf("got stack.GetMainNICAddress(_, _) = %s, want = %s", addr, addr1)
-	}
-
-	// We should not have sent any NDP NS messages.
-	if got := s.Stats().ICMP.V6PacketsSent.NeighborSolicit.Value(); got != 0 {
-		t.Fatalf("got NeighborSolicit = %d, want = 0", got)
-	}
 }
 
 // ndpDADEvent is a set of parameters that was passed to
@@ -298,6 +267,58 @@ func (n *ndpDispatcher) OnDHCPv6Configuration(nicID tcpip.NICID, configuration s
 	}
 }
 
+// Check e to make sure that the event is for addr on nic with ID 1, and the
+// resolved flag set to resolved with the specified err.
+func checkDADEvent(e ndpDADEvent, nicID tcpip.NICID, addr tcpip.Address, resolved bool, err *tcpip.Error) string {
+	return cmp.Diff(ndpDADEvent{nicID: nicID, addr: addr, resolved: resolved, err: err}, e, cmp.AllowUnexported(e))
+}
+
+// TestDADDisabled tests that an address successfully resolves immediately
+// when DAD is not enabled (the default for an empty stack.Options).
+func TestDADDisabled(t *testing.T) {
+	const nicID = 1
+	ndpDisp := ndpDispatcher{
+		dadC: make(chan ndpDADEvent, 1),
+	}
+	opts := stack.Options{
+		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NDPDisp:          &ndpDisp,
+	}
+
+	e := channel.New(0, 1280, linkAddr1)
+	s := stack.New(opts)
+	if err := s.CreateNIC(nicID, e); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
+	}
+
+	if err := s.AddAddress(nicID, header.IPv6ProtocolNumber, addr1); err != nil {
+		t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, header.IPv6ProtocolNumber, addr1, err)
+	}
+
+	// Should get the address immediately since we should not have performed
+	// DAD on it.
+	select {
+	case e := <-ndpDisp.dadC:
+		if diff := checkDADEvent(e, nicID, addr1, true, nil); diff != "" {
+			t.Errorf("dad event mismatch (-want +got):\n%s", diff)
+		}
+	default:
+		t.Fatal("expected DAD event")
+	}
+	addr, err := s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
+	if err != nil {
+		t.Fatalf("stack.GetMainNICAddress(%d, %d) err = %s", nicID, header.IPv6ProtocolNumber, err)
+	}
+	if addr.Address != addr1 {
+		t.Fatalf("got stack.GetMainNICAddress(%d, %d) = %s, want = %s", nicID, header.IPv6ProtocolNumber, addr, addr1)
+	}
+
+	// We should not have sent any NDP NS messages.
+	if got := s.Stats().ICMP.V6PacketsSent.NeighborSolicit.Value(); got != 0 {
+		t.Fatalf("got NeighborSolicit = %d, want = 0", got)
+	}
+}
+
 // TestDADResolve tests that an address successfully resolves after performing
 // DAD for various values of DupAddrDetectTransmits and RetransmitTimer.
 // Included in the subtests is a test to make sure that an invalid
@@ -379,17 +400,8 @@ func TestDADResolve(t *testing.T) {
 				// means something is wrong.
 				t.Fatal("timed out waiting for DAD resolution")
 			case e := <-ndpDisp.dadC:
-				if e.err != nil {
-					t.Fatal("got DAD error: ", e.err)
-				}
-				if e.nicID != nicID {
-					t.Fatalf("got DAD event w/ nicID = %d, want = %d", e.nicID, nicID)
-				}
-				if e.addr != addr1 {
-					t.Fatalf("got DAD event w/ addr = %s, want = %s", addr, addr1)
-				}
-				if !e.resolved {
-					t.Fatal("got DAD event w/ resolved = false, want = true")
+				if diff := checkDADEvent(e, nicID, addr1, true, nil); diff != "" {
+					t.Errorf("dad event mismatch (-want +got):\n%s", diff)
 				}
 			}
 			addr, err = s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
@@ -443,6 +455,8 @@ func TestDADResolve(t *testing.T) {
 // a node doing DAD for the same address), or if another node is detected to own
 // the address already (receive an NA message for the tentative address).
 func TestDADFail(t *testing.T) {
+	const nicID = 1
+
 	tests := []struct {
 		name    string
 		makeBuf func(tgt tcpip.Address) buffer.Prependable
@@ -520,22 +534,22 @@ func TestDADFail(t *testing.T) {
 
 			e := channel.New(0, 1280, linkAddr1)
 			s := stack.New(opts)
-			if err := s.CreateNIC(1, e); err != nil {
-				t.Fatalf("CreateNIC(_) = %s", err)
+			if err := s.CreateNIC(nicID, e); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 			}
 
-			if err := s.AddAddress(1, header.IPv6ProtocolNumber, addr1); err != nil {
-				t.Fatalf("AddAddress(_, %d, %s) = %s", header.IPv6ProtocolNumber, addr1, err)
+			if err := s.AddAddress(nicID, header.IPv6ProtocolNumber, addr1); err != nil {
+				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, header.IPv6ProtocolNumber, addr1, err)
 			}
 
 			// Address should not be considered bound to the NIC yet
 			// (DAD ongoing).
-			addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+			addr, err := s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID, header.IPv6ProtocolNumber, err)
 			}
 			if want := (tcpip.AddressWithPrefix{}); addr != want {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID, header.IPv6ProtocolNumber, addr, want)
 			}
 
 			// Receive a packet to simulate multiple nodes owning or
@@ -559,25 +573,16 @@ func TestDADFail(t *testing.T) {
 				// something is wrong.
 				t.Fatal("timed out waiting for DAD failure")
 			case e := <-ndpDisp.dadC:
-				if e.err != nil {
-					t.Fatal("got DAD error: ", e.err)
-				}
-				if e.nicID != 1 {
-					t.Fatalf("got DAD event w/ nicID = %d, want = 1", e.nicID)
-				}
-				if e.addr != addr1 {
-					t.Fatalf("got DAD event w/ addr = %s, want = %s", addr, addr1)
-				}
-				if e.resolved {
-					t.Fatal("got DAD event w/ resolved = true, want = false")
+				if diff := checkDADEvent(e, nicID, addr1, false, nil); diff != "" {
+					t.Errorf("dad event mismatch (-want +got):\n%s", diff)
 				}
 			}
-			addr, err = s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+			addr, err = s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID, header.IPv6ProtocolNumber, err)
 			}
 			if want := (tcpip.AddressWithPrefix{}); addr != want {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID, header.IPv6ProtocolNumber, addr, want)
 			}
 		})
 	}
@@ -586,6 +591,8 @@ func TestDADFail(t *testing.T) {
 // TestDADStop tests to make sure that the DAD process stops when an address is
 // removed.
 func TestDADStop(t *testing.T) {
+	const nicID = 1
+
 	ndpDisp := ndpDispatcher{
 		dadC: make(chan ndpDADEvent, 1),
 	}
@@ -601,26 +608,26 @@ func TestDADStop(t *testing.T) {
 
 	e := channel.New(0, 1280, linkAddr1)
 	s := stack.New(opts)
-	if err := s.CreateNIC(1, e); err != nil {
-		t.Fatalf("CreateNIC(_) = %s", err)
+	if err := s.CreateNIC(nicID, e); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID, err)
 	}
 
-	if err := s.AddAddress(1, header.IPv6ProtocolNumber, addr1); err != nil {
-		t.Fatalf("AddAddress(_, %d, %s) = %s", header.IPv6ProtocolNumber, addr1, err)
+	if err := s.AddAddress(nicID, header.IPv6ProtocolNumber, addr1); err != nil {
+		t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID, header.IPv6ProtocolNumber, addr1, err)
 	}
 
 	// Address should not be considered bound to the NIC yet (DAD ongoing).
-	addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+	addr, err := s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
 	if err != nil {
-		t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+		t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID, header.IPv6ProtocolNumber, err)
 	}
 	if want := (tcpip.AddressWithPrefix{}); addr != want {
-		t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+		t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID, header.IPv6ProtocolNumber, addr, want)
 	}
 
 	// Remove the address. This should stop DAD.
-	if err := s.RemoveAddress(1, addr1); err != nil {
-		t.Fatalf("RemoveAddress(_, %s) = %s", addr1, err)
+	if err := s.RemoveAddress(nicID, addr1); err != nil {
+		t.Fatalf("RemoveAddress(%d, %s) = %s", nicID, addr1, err)
 	}
 
 	// Wait for DAD to fail (since the address was removed during DAD).
@@ -630,26 +637,16 @@ func TestDADStop(t *testing.T) {
 		// time + extra 1s buffer, something is wrong.
 		t.Fatal("timed out waiting for DAD failure")
 	case e := <-ndpDisp.dadC:
-		if e.err != nil {
-			t.Fatal("got DAD error: ", e.err)
+		if diff := checkDADEvent(e, nicID, addr1, false, nil); diff != "" {
+			t.Errorf("dad event mismatch (-want +got):\n%s", diff)
 		}
-		if e.nicID != 1 {
-			t.Fatalf("got DAD event w/ nicID = %d, want = 1", e.nicID)
-		}
-		if e.addr != addr1 {
-			t.Fatalf("got DAD event w/ addr = %s, want = %s", addr, addr1)
-		}
-		if e.resolved {
-			t.Fatal("got DAD event w/ resolved = true, want = false")
-		}
-
 	}
-	addr, err = s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+	addr, err = s.GetMainNICAddress(nicID, header.IPv6ProtocolNumber)
 	if err != nil {
-		t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+		t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID, header.IPv6ProtocolNumber, err)
 	}
 	if want := (tcpip.AddressWithPrefix{}); addr != want {
-		t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+		t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID, header.IPv6ProtocolNumber, addr, want)
 	}
 
 	// Should not have sent more than 1 NS message.
@@ -675,6 +672,10 @@ func TestSetNDPConfigurationFailsForBadNICID(t *testing.T) {
 // configurations without affecting the default NDP configurations or other
 // interfaces' configurations.
 func TestSetNDPConfigurations(t *testing.T) {
+	const nicID1 = 1
+	const nicID2 = 2
+	const nicID3 = 3
+
 	tests := []struct {
 		name                    string
 		dupAddrDetectTransmits  uint8
@@ -698,7 +699,7 @@ func TestSetNDPConfigurations(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			ndpDisp := ndpDispatcher{
-				dadC: make(chan ndpDADEvent),
+				dadC: make(chan ndpDADEvent, 1),
 			}
 			e := channel.New(0, 1280, linkAddr1)
 			s := stack.New(stack.Options{
@@ -706,17 +707,28 @@ func TestSetNDPConfigurations(t *testing.T) {
 				NDPDisp:          &ndpDisp,
 			})
 
+			expectDADEvent := func(nicID tcpip.NICID, addr tcpip.Address) {
+				select {
+				case e := <-ndpDisp.dadC:
+					if diff := checkDADEvent(e, nicID, addr, true, nil); diff != "" {
+						t.Errorf("dad event mismatch (-want +got):\n%s", diff)
+					}
+				default:
+					t.Fatalf("expected DAD event for %s", addr)
+				}
+			}
+
 			// This NIC(1)'s NDP configurations will be updated to
 			// be different from the default.
-			if err := s.CreateNIC(1, e); err != nil {
-				t.Fatalf("CreateNIC(1) = %s", err)
+			if err := s.CreateNIC(nicID1, e); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID1, err)
 			}
 
 			// Created before updating NIC(1)'s NDP configurations
 			// but updating NIC(1)'s NDP configurations should not
 			// affect other existing NICs.
-			if err := s.CreateNIC(2, e); err != nil {
-				t.Fatalf("CreateNIC(2) = %s", err)
+			if err := s.CreateNIC(nicID2, e); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID2, err)
 			}
 
 			// Update the NDP configurations on NIC(1) to use DAD.
@@ -724,36 +736,38 @@ func TestSetNDPConfigurations(t *testing.T) {
 				DupAddrDetectTransmits: test.dupAddrDetectTransmits,
 				RetransmitTimer:        test.retransmitTimer,
 			}
-			if err := s.SetNDPConfigurations(1, configs); err != nil {
-				t.Fatalf("got SetNDPConfigurations(1, _) = %s", err)
+			if err := s.SetNDPConfigurations(nicID1, configs); err != nil {
+				t.Fatalf("got SetNDPConfigurations(%d, _) = %s", nicID1, err)
 			}
 
 			// Created after updating NIC(1)'s NDP configurations
 			// but the stack's default NDP configurations should not
 			// have been updated.
-			if err := s.CreateNIC(3, e); err != nil {
-				t.Fatalf("CreateNIC(3) = %s", err)
+			if err := s.CreateNIC(nicID3, e); err != nil {
+				t.Fatalf("CreateNIC(%d, _) = %s", nicID3, err)
 			}
 
 			// Add addresses for each NIC.
-			if err := s.AddAddress(1, header.IPv6ProtocolNumber, addr1); err != nil {
-				t.Fatalf("AddAddress(1, %d, %s) = %s", header.IPv6ProtocolNumber, addr1, err)
+			if err := s.AddAddress(nicID1, header.IPv6ProtocolNumber, addr1); err != nil {
+				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID1, header.IPv6ProtocolNumber, addr1, err)
 			}
-			if err := s.AddAddress(2, header.IPv6ProtocolNumber, addr2); err != nil {
-				t.Fatalf("AddAddress(2, %d, %s) = %s", header.IPv6ProtocolNumber, addr2, err)
+			if err := s.AddAddress(nicID2, header.IPv6ProtocolNumber, addr2); err != nil {
+				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID2, header.IPv6ProtocolNumber, addr2, err)
 			}
-			if err := s.AddAddress(3, header.IPv6ProtocolNumber, addr3); err != nil {
-				t.Fatalf("AddAddress(3, %d, %s) = %s", header.IPv6ProtocolNumber, addr3, err)
+			expectDADEvent(nicID2, addr2)
+			if err := s.AddAddress(nicID3, header.IPv6ProtocolNumber, addr3); err != nil {
+				t.Fatalf("AddAddress(%d, %d, %s) = %s", nicID3, header.IPv6ProtocolNumber, addr3, err)
 			}
+			expectDADEvent(nicID3, addr3)
 
 			// Address should not be considered bound to NIC(1) yet
 			// (DAD ongoing).
-			addr, err := s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+			addr, err := s.GetMainNICAddress(nicID1, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID1, header.IPv6ProtocolNumber, err)
 			}
 			if want := (tcpip.AddressWithPrefix{}); addr != want {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID1, header.IPv6ProtocolNumber, addr, want)
 			}
 
 			// Should get the address on NIC(2) and NIC(3)
@@ -761,31 +775,31 @@ func TestSetNDPConfigurations(t *testing.T) {
 			// it as the stack was configured to not do DAD by
 			// default and we only updated the NDP configurations on
 			// NIC(1).
-			addr, err = s.GetMainNICAddress(2, header.IPv6ProtocolNumber)
+			addr, err = s.GetMainNICAddress(nicID2, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("stack.GetMainNICAddress(2, _) err = %s", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID2, header.IPv6ProtocolNumber, err)
 			}
 			if addr.Address != addr2 {
-				t.Fatalf("got stack.GetMainNICAddress(2, _) = %s, want = %s", addr, addr2)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = %s, want = %s", nicID2, header.IPv6ProtocolNumber, addr, addr2)
 			}
-			addr, err = s.GetMainNICAddress(3, header.IPv6ProtocolNumber)
+			addr, err = s.GetMainNICAddress(nicID3, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("stack.GetMainNICAddress(3, _) err = %s", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID3, header.IPv6ProtocolNumber, err)
 			}
 			if addr.Address != addr3 {
-				t.Fatalf("got stack.GetMainNICAddress(3, _) = %s, want = %s", addr, addr3)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = %s, want = %s", nicID3, header.IPv6ProtocolNumber, addr, addr3)
 			}
 
 			// Sleep until right (500ms before) before resolution to
 			// make sure the address didn't resolve on NIC(1) yet.
 			const delta = 500 * time.Millisecond
 			time.Sleep(time.Duration(test.dupAddrDetectTransmits)*test.expectedRetransmitTimer - delta)
-			addr, err = s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+			addr, err = s.GetMainNICAddress(nicID1, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (_, %v), want = (_, nil)", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID1, header.IPv6ProtocolNumber, err)
 			}
 			if want := (tcpip.AddressWithPrefix{}); addr != want {
-				t.Fatalf("got stack.GetMainNICAddress(_, _) = (%s, nil), want = (%s, nil)", addr, want)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (%s, nil), want = (%s, nil)", nicID1, header.IPv6ProtocolNumber, addr, want)
 			}
 
 			// Wait for DAD to resolve.
@@ -799,25 +813,16 @@ func TestSetNDPConfigurations(t *testing.T) {
 				// means something is wrong.
 				t.Fatal("timed out waiting for DAD resolution")
 			case e := <-ndpDisp.dadC:
-				if e.err != nil {
-					t.Fatal("got DAD error: ", e.err)
-				}
-				if e.nicID != 1 {
-					t.Fatalf("got DAD event w/ nicID = %d, want = 1", e.nicID)
-				}
-				if e.addr != addr1 {
-					t.Fatalf("got DAD event w/ addr = %s, want = %s", addr, addr1)
-				}
-				if !e.resolved {
-					t.Fatal("got DAD event w/ resolved = false, want = true")
+				if diff := checkDADEvent(e, nicID1, addr1, true, nil); diff != "" {
+					t.Errorf("dad event mismatch (-want +got):\n%s", diff)
 				}
 			}
-			addr, err = s.GetMainNICAddress(1, header.IPv6ProtocolNumber)
+			addr, err = s.GetMainNICAddress(nicID1, header.IPv6ProtocolNumber)
 			if err != nil {
-				t.Fatalf("stack.GetMainNICAddress(1, _) err = %s", err)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = (_, %v), want = (_, nil)", nicID1, header.IPv6ProtocolNumber, err)
 			}
 			if addr.Address != addr1 {
-				t.Fatalf("got stack.GetMainNICAddress(1, _) = %s, want = %s", addr, addr1)
+				t.Fatalf("got stack.GetMainNICAddress(%d, %d) = %s, want = %s", nicID1, header.IPv6ProtocolNumber, addr, addr1)
 			}
 		})
 	}
@@ -2878,8 +2883,8 @@ func TestNDPRecursiveDNSServerDispatch(t *testing.T) {
 }
 
 // TestCleanupHostOnlyStateOnBecomingRouter tests that all discovered routers
-// and prefixes, and auto-generated addresses get invalidated when a NIC
-// becomes a router.
+// and prefixes, and non-linklocal auto-generated addresses get invalidated when
+// a NIC becomes a router.
 func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 	t.Parallel()
 
@@ -2894,6 +2899,14 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 	prefix2, subnet2, e1Addr2 := prefixSubnetAddr(1, linkAddr1)
 	e2Addr1 := addrForSubnet(subnet1, linkAddr2)
 	e2Addr2 := addrForSubnet(subnet2, linkAddr2)
+	llAddrWithPrefix1 := tcpip.AddressWithPrefix{
+		Address:   llAddr1,
+		PrefixLen: 64,
+	}
+	llAddrWithPrefix2 := tcpip.AddressWithPrefix{
+		Address:   llAddr2,
+		PrefixLen: 64,
+	}
 
 	ndpDisp := ndpDispatcher{
 		routerC:        make(chan ndpRouterEvent, maxEvents),
@@ -2903,7 +2916,8 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		autoGenAddrC:   make(chan ndpAutoGenAddrEvent, maxEvents),
 	}
 	s := stack.New(stack.Options{
-		NetworkProtocols: []stack.NetworkProtocol{ipv6.NewProtocol()},
+		NetworkProtocols:     []stack.NetworkProtocol{ipv6.NewProtocol()},
+		AutoGenIPv6LinkLocal: true,
 		NDPConfigs: stack.NDPConfigurations{
 			HandleRAs:              true,
 			DiscoverDefaultRouters: true,
@@ -2912,16 +2926,6 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		},
 		NDPDisp: &ndpDisp,
 	})
-
-	e1 := channel.New(0, 1280, linkAddr1)
-	if err := s.CreateNIC(nicID1, e1); err != nil {
-		t.Fatalf("CreateNIC(%d, _) = %s", nicID1, err)
-	}
-
-	e2 := channel.New(0, 1280, linkAddr2)
-	if err := s.CreateNIC(nicID2, e2); err != nil {
-		t.Fatalf("CreateNIC(%d, _) = %s", nicID2, err)
-	}
 
 	expectRouterEvent := func() (bool, ndpRouterEvent) {
 		select {
@@ -2953,18 +2957,30 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		return false, ndpAutoGenAddrEvent{}
 	}
 
-	// Receive RAs on NIC(1) and NIC(2) from default routers (llAddr1 and
-	// llAddr2) w/ PI (for prefix1 in RA from llAddr1 and prefix2 in RA from
-	// llAddr2) to discover multiple routers and prefixes, and auto-gen
-	// multiple addresses.
-
-	e1.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr1, lifetimeSeconds, prefix1, true, true, lifetimeSeconds, lifetimeSeconds))
+	e1 := channel.New(0, 1280, linkAddr1)
+	if err := s.CreateNIC(nicID1, e1); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID1, err)
+	}
 	// We have other tests that make sure we receive the *correct* events
 	// on normal discovery of routers/prefixes, and auto-generated
 	// addresses. Here we just make sure we get an event and let other tests
 	// handle the correctness check.
+	expectAutoGenAddrEvent()
+
+	e2 := channel.New(0, 1280, linkAddr2)
+	if err := s.CreateNIC(nicID2, e2); err != nil {
+		t.Fatalf("CreateNIC(%d, _) = %s", nicID2, err)
+	}
+	expectAutoGenAddrEvent()
+
+	// Receive RAs on NIC(1) and NIC(2) from default routers (llAddr3 and
+	// llAddr4) w/ PI (for prefix1 in RA from llAddr3 and prefix2 in RA from
+	// llAddr4) to discover multiple routers and prefixes, and auto-gen
+	// multiple addresses.
+
+	e1.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr3, lifetimeSeconds, prefix1, true, true, lifetimeSeconds, lifetimeSeconds))
 	if ok, _ := expectRouterEvent(); !ok {
-		t.Errorf("expected router event for %s on NIC(%d)", llAddr1, nicID1)
+		t.Errorf("expected router event for %s on NIC(%d)", llAddr3, nicID1)
 	}
 	if ok, _ := expectPrefixEvent(); !ok {
 		t.Errorf("expected prefix event for %s on NIC(%d)", prefix1, nicID1)
@@ -2973,9 +2989,9 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		t.Errorf("expected auto-gen addr event for %s on NIC(%d)", e1Addr1, nicID1)
 	}
 
-	e1.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, lifetimeSeconds, prefix2, true, true, lifetimeSeconds, lifetimeSeconds))
+	e1.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr4, lifetimeSeconds, prefix2, true, true, lifetimeSeconds, lifetimeSeconds))
 	if ok, _ := expectRouterEvent(); !ok {
-		t.Errorf("expected router event for %s on NIC(%d)", llAddr2, nicID1)
+		t.Errorf("expected router event for %s on NIC(%d)", llAddr4, nicID1)
 	}
 	if ok, _ := expectPrefixEvent(); !ok {
 		t.Errorf("expected prefix event for %s on NIC(%d)", prefix2, nicID1)
@@ -2984,9 +3000,9 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		t.Errorf("expected auto-gen addr event for %s on NIC(%d)", e1Addr2, nicID1)
 	}
 
-	e2.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr1, lifetimeSeconds, prefix1, true, true, lifetimeSeconds, lifetimeSeconds))
+	e2.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr3, lifetimeSeconds, prefix1, true, true, lifetimeSeconds, lifetimeSeconds))
 	if ok, _ := expectRouterEvent(); !ok {
-		t.Errorf("expected router event for %s on NIC(%d)", llAddr1, nicID2)
+		t.Errorf("expected router event for %s on NIC(%d)", llAddr3, nicID2)
 	}
 	if ok, _ := expectPrefixEvent(); !ok {
 		t.Errorf("expected prefix event for %s on NIC(%d)", prefix1, nicID2)
@@ -2995,9 +3011,9 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 		t.Errorf("expected auto-gen addr event for %s on NIC(%d)", e1Addr2, nicID2)
 	}
 
-	e2.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr2, lifetimeSeconds, prefix2, true, true, lifetimeSeconds, lifetimeSeconds))
+	e2.InjectInbound(header.IPv6ProtocolNumber, raBufWithPI(llAddr4, lifetimeSeconds, prefix2, true, true, lifetimeSeconds, lifetimeSeconds))
 	if ok, _ := expectRouterEvent(); !ok {
-		t.Errorf("expected router event for %s on NIC(%d)", llAddr2, nicID2)
+		t.Errorf("expected router event for %s on NIC(%d)", llAddr4, nicID2)
 	}
 	if ok, _ := expectPrefixEvent(); !ok {
 		t.Errorf("expected prefix event for %s on NIC(%d)", prefix2, nicID2)
@@ -3010,11 +3026,17 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 	nicinfo := s.NICInfo()
 	nic1Addrs := nicinfo[nicID1].ProtocolAddresses
 	nic2Addrs := nicinfo[nicID2].ProtocolAddresses
+	if !contains(nic1Addrs, llAddrWithPrefix1) {
+		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", llAddrWithPrefix1, nicID1, nic1Addrs)
+	}
 	if !contains(nic1Addrs, e1Addr1) {
 		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", e1Addr1, nicID1, nic1Addrs)
 	}
 	if !contains(nic1Addrs, e1Addr2) {
 		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", e1Addr2, nicID1, nic1Addrs)
+	}
+	if !contains(nic2Addrs, llAddrWithPrefix2) {
+		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", llAddrWithPrefix2, nicID2, nic2Addrs)
 	}
 	if !contains(nic2Addrs, e2Addr1) {
 		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", e2Addr1, nicID2, nic2Addrs)
@@ -3067,10 +3089,10 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 	}
 
 	expectedRouterEvents := map[ndpRouterEvent]int{
-		{nicID: nicID1, addr: llAddr1, discovered: false}: 1,
-		{nicID: nicID1, addr: llAddr2, discovered: false}: 1,
-		{nicID: nicID2, addr: llAddr1, discovered: false}: 1,
-		{nicID: nicID2, addr: llAddr2, discovered: false}: 1,
+		{nicID: nicID1, addr: llAddr3, discovered: false}: 1,
+		{nicID: nicID1, addr: llAddr4, discovered: false}: 1,
+		{nicID: nicID2, addr: llAddr3, discovered: false}: 1,
+		{nicID: nicID2, addr: llAddr4, discovered: false}: 1,
 	}
 	if diff := cmp.Diff(expectedRouterEvents, gotRouterEvents); diff != "" {
 		t.Errorf("router events mismatch (-want +got):\n%s", diff)
@@ -3098,11 +3120,17 @@ func TestCleanupHostOnlyStateOnBecomingRouter(t *testing.T) {
 	nicinfo = s.NICInfo()
 	nic1Addrs = nicinfo[nicID1].ProtocolAddresses
 	nic2Addrs = nicinfo[nicID2].ProtocolAddresses
+	if !contains(nic1Addrs, llAddrWithPrefix1) {
+		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", llAddrWithPrefix1, nicID1, nic1Addrs)
+	}
 	if contains(nic1Addrs, e1Addr1) {
 		t.Errorf("still have %s in the list of addresses for NIC(%d): %+v", e1Addr1, nicID1, nic1Addrs)
 	}
 	if contains(nic1Addrs, e1Addr2) {
 		t.Errorf("still have %s in the list of addresses for NIC(%d): %+v", e1Addr2, nicID1, nic1Addrs)
+	}
+	if !contains(nic2Addrs, llAddrWithPrefix2) {
+		t.Errorf("missing %s from the list of addresses for NIC(%d): %+v", llAddrWithPrefix2, nicID2, nic2Addrs)
 	}
 	if contains(nic2Addrs, e2Addr1) {
 		t.Errorf("still have %s in the list of addresses for NIC(%d): %+v", e2Addr1, nicID2, nic2Addrs)
