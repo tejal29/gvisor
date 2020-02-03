@@ -906,6 +906,11 @@ func (ndp *ndpState) handleAutonomousPrefixInformation(pi header.NDPPrefixInform
 		return
 	}
 
+	// Are we configured to auto-generate new global addresses?
+	if !ndp.configs.AutoGenGlobalAddresses {
+		return
+	}
+
 	// We do not already have an address within the prefix, prefix. Do the
 	// work as outlined by RFC 4862 section 5.5.3.d if n is configured
 	// to auto-generated global addresses by SLAAC.
@@ -917,11 +922,6 @@ func (ndp *ndpState) handleAutonomousPrefixInformation(pi header.NDPPrefixInform
 //
 // pl is the new preferred lifetime. vl is the new valid lifetime.
 func (ndp *ndpState) newAutoGenAddress(prefix tcpip.Subnet, pl, vl time.Duration) {
-	// Are we configured to auto-generate new global addresses?
-	if !ndp.configs.AutoGenGlobalAddresses {
-		return
-	}
-
 	// If we do not already have an address for this prefix and the valid
 	// lifetime is 0, no need to do anything further, as per RFC 4862
 	// section 5.5.3.d.
