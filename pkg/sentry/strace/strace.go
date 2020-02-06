@@ -55,6 +55,14 @@ var ItimerTypes = abi.ValueSet{
 	linux.ITIMER_PROF:    "ITIMER_PROF",
 }
 
+func hexNum(num uint64) string {
+	return "0x" + strconv.FormatUint(num, 16)
+}
+
+func hexArg(arg arch.SyscallArgument) string {
+	return hexNum(arg.Uint64())
+}
+
 func iovecs(t *kernel.Task, addr usermem.Addr, iovcnt int, printContent bool, maxBytes uint64) string {
 	if iovcnt < 0 || iovcnt > linux.UIO_MAXIOV {
 		return fmt.Sprintf("%#x (error decoding iovecs: invalid iovcnt)", addr)
@@ -389,6 +397,8 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 			output = append(output, path(t, args[arg].Pointer()))
 		case ExecveStringVector:
 			output = append(output, stringVector(t, args[arg].Pointer()))
+		case SetOptVal:
+			output = append(output, sockOptVal(t, uint32(args[arg-2].Uint64()), uint32(args[arg-1].Uint64()), args[arg].Pointer(), uint32(args[arg+1].Uint64()), maximumBlobSize))
 		case SockAddr:
 			output = append(output, sockAddr(t, args[arg].Pointer(), uint32(args[arg+1].Uint64())))
 		case SockLen:
@@ -446,7 +456,7 @@ func (i *SyscallInfo) pre(t *kernel.Task, args arch.SyscallArguments, maximumBlo
 		case Hex:
 			fallthrough
 		default:
-			output = append(output, "0x"+strconv.FormatUint(args[arg].Uint64(), 16))
+			output = append(output, hexArg(args[arg]))
 		}
 	}
 
@@ -507,6 +517,11 @@ func (i *SyscallInfo) post(t *kernel.Task, args arch.SyscallArguments, rval uint
 			output[arg] = capData(t, args[arg-1].Pointer(), args[arg].Pointer())
 		case PollFDs:
 			output[arg] = pollFDs(t, args[arg].Pointer(), uint(args[arg+1].Uint()), true)
+		case GetOptVal:
+			output[arg] = getSockOptVal(t, uint32(args[arg-2].Uint64()), uint32(args[arg-1].Uint64()), args[arg].Pointer(), args[arg+1].Pointer(), maximumBlobSize, rval)
+		case SetOptVal:
+			// No need to print the value again.
+			output[arg] = hexArg(args[arg])
 		}
 	}
 }

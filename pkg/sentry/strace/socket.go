@@ -16,6 +16,7 @@ package strace
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/abi"
@@ -418,4 +419,46 @@ func sockFlags(flags int32) string {
 		return "0"
 	}
 	return SocketFlagSet.Parse(uint64(flags))
+}
+
+func getSockOptVal(t *kernel.Task, level, optname uint32, addr usermem.Addr, length usermem.Addr, maximumBlobSize uint, rval uintptr) string {
+	if int(rval) < 0 {
+		return hexNum(uint64(addr))
+	}
+	if addr == 0 {
+		return "null"
+	}
+	l, err := copySockLen(t, length)
+	if err != nil {
+		return fmt.Sprintf("%#x {error reading length: %v}", length, err)
+	}
+	return sockOptVal(t, level, optname, addr, l, maximumBlobSize)
+}
+
+func sockOptVal(t *kernel.Task, level, optname uint32, addr usermem.Addr, length uint32, maximumBlobSize uint) string {
+	switch length {
+	case 8:
+		var v uint8
+		_, err := t.CopyIn(addr, &v)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", addr, err)
+		}
+		return strconv.FormatUint(uint64(v), 10)
+	case 16:
+		var v uint16
+		_, err := t.CopyIn(addr, &v)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", addr, err)
+		}
+		return strconv.FormatUint(uint64(v), 10)
+	case 32:
+		var v uint32
+		_, err := t.CopyIn(addr, &v)
+		if err != nil {
+			return fmt.Sprintf("%#x {error reading optval: %v}", addr, err)
+		}
+		return strconv.FormatUint(uint64(v), 10)
+	default:
+		return dump(t, addr, uint(length), maximumBlobSize)
+	}
 }

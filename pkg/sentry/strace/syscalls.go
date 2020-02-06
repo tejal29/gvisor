@@ -210,6 +210,12 @@ const (
 	// SelectFDSet is an fd_set argument in select(2)/pselect(2). The number of
 	// fds represented must be the first argument.
 	SelectFDSet
+
+	// GetOptVal is the optval argument in getsockopt(2).
+	GetOptVal
+
+	// SetOptVal is the optval argument in setsockopt(2).
+	SetOptVal
 )
 
 // defaultFormat is the syscall argument format to use if the actual format is
